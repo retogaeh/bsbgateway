@@ -24,6 +24,7 @@ adapter_settings = {
     # * '/dev/ttyUSB0' is the usual device for a USB-to-serial converter on Linux.
     # * ':sim' opens a simple device simulation (no actual serial port required)
     'adapter_device': ':sim',
+    #'adapter_device': '/dev/ttyAMA1',
     #'adapter_device': '/dev/ttyUSB0',
     
     # hardware settings - ignored when using simulation.
@@ -34,14 +35,18 @@ adapter_settings = {
     'port_stopbits': 1,
     # 'odd' or 'even'. For BSB: 'odd' if you invert bytes (see below), 'even' if not.
     'port_parity': 'odd',
+    # hw rts / cts support, requires appropriate setup of hardware
+    'port_rtscts': True,
     # flip all bits after receive + before send. If you use a simple BSB-to-UART
     # level converter, you most probably need to set this to True.
     'invert_bytes': True,
     # Only send if CTS has this state (True or False); None to disable.
     # Use this if your adapter has a "bus in use" detection wired to CTS pin of the RS232 interface.
     'expect_cts_state': None,
-    # wait time in seconds if blocked by CTS (see above).
-    'write_retry_time': 0.005,
+    # wait time in seconds until a retransmission in case of no response
+    'write_resend_time': 0.5,
+    # number of retries before giving up in case of no response
+    'num_resend' : 3,
 }
 
 # Bus adress offset of Gateway. Allowed range: 11 ... 125.

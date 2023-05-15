@@ -28,6 +28,7 @@ import logging
 log = lambda: logging.getLogger(__name__)
 
 import time
+import serial
 
 from .event_sources import SyncedSecondTimerSource, HubSource, DelaySource
 from .single_field_logger import SingleFieldLogger
@@ -36,14 +37,17 @@ from .cmd_interface import CmdInterface
 from .email_action import make_email_action
 from .bsb.bsb_comm import BsbComm
 from .bsb.bsb_field import EncodeError, ValidateError
+from .serial_source import SerialSource
+from .virtual_serial import VirtualSerial
+from .virtual_device import virtual_device
 
 
 class BsbGateway(object):
     _hub = None
 
-    def __init__(o, adapter_settings, device, bus_address, loggers, atomic_interval, web_interface_port=8080, web_dashboard=None, cmd_interface_enable=True, min_wait_s=0.1):
+    def __init__(o, bsbcomm: BsbComm, device, loggers, atomic_interval, web_interface_port=8080, web_dashboard=None, cmd_interface_enable=True):
         o.device = device
-        o._bsbcomm = BsbComm('bsb', adapter_settings, device, bus_address, n_addresses=3, min_wait_s=min_wait_s)
+        o._bsbcomm = bsbcomm
         o.loggers = loggers
         o.atomic_interval = atomic_interval
         o.web_interface_port = web_interface_port
@@ -51,30 +55,30 @@ class BsbGateway(object):
         o.pending_web_requests = []
         o._cmd_interface_enable = cmd_interface_enable
         o.cmd_interface = None
-        
+
     def run(o):
         log().info('BsbGateway (c) J. Loehnert 2013-2015, starting @%s'%time.time())
         for logger in o.loggers:
             logger.send_get_telegram = lambda disp_id: o._bsbcomm.send_get(disp_id)
 
         o._delay = DelaySource("delay")
-        
+
         sources = [
             SyncedSecondTimerSource('timer'),
             o._delay,
             o._bsbcomm,
         ]
-        
+
         # Configuration switch tbd
         if o._cmd_interface_enable:
             o.cmd_interface = CmdInterface(o)
             sources.append(o.cmd_interface)
         else:
             log().info('Running without cmdline interface. Use Ctrl+C or SIGTERM to quit.')
-        
+
         if o.web_interface_port:
             sources.append(WebInterface('web', device=o.device, port=o.web_interface_port, dashboard=o.web_dashboard) )
-            
+
         o._hub = HubSource()
         for source in sources:
             o._hub.add_and_start_source(source)
@@ -95,7 +99,7 @@ class BsbGateway(object):
             return
         for logger in o.loggers:
             logger.tick()
-            
+
     def on_bsb_event(o, telegrams):
         for which_address, telegram in telegrams:
             if o.cmd_interface:
@@ -113,7 +117,7 @@ class BsbGateway(object):
                         rq[1].put(telegram)
                 # and remove from pending-list
                 o.pending_web_requests = [rq for rq in o.pending_web_requests if rq[0] != key]
-                        
+
     def on_web_event(o, request):
         # FIXME: rate limit 10/s
         rq = request.pop(0) # the result queue
@@ -142,19 +146,19 @@ class BsbGateway(object):
 
     def on_delay_event(o, action):
         action()
-        
+
     def quit(o):
         o._hub.stop()
-        
+
     def cmdline_get(o, disp_id):
         o._bsbcomm.send_get(disp_id, 1)
-        
+
     def cmdline_set(o, disp_id, value, validate=True):
         o._bsbcomm.send_set(disp_id, value, 1, validate=validate)
-        
+
     def set_sniffmode(o, sniffmode=False):
         o._bsbcomm.sniffmode = sniffmode
-        
+
 
 def run(config):
     # FIXME: make this a dynamic import.
@@ -162,9 +166,9 @@ def run(config):
         from .bsb import broetje_isr_plus as device
     else:
         raise ValueError('Unsupported device')
-    
+
     emailaction = make_email_action(config['emailserver'], config['emailaddress'], config['emailcredentials'])
-    
+
     if config['loggers']:
         if not os.path.exists(config['tracefile_dir']):
             log().info('Creating trace directory %s'%config['tracefile_dir'])
@@ -172,10 +176,10 @@ def run(config):
     loggers = [
         SingleFieldLogger(
             field=device.fields[disp_id],
-            interval=interval, 
+            interval=interval,
             atomic_interval=config['atomic_interval'],
             filename=os.path.join(config['tracefile_dir'], '%d.trace'%disp_id)
-        ) 
+        )
         for disp_id, interval in config['loggers']
     ]
     for trigger in config['triggers']:
@@ -187,15 +191,54 @@ def run(config):
     tt = config["adapter_settings"].pop("adapter_type", "")
     if tt == "fake":
         config["adapter_settings"]["adapter_device"] = ":sim"
-                
+
+    # create serial device & bsb_comm and inject them
+    # TODO: move to factory once created
+    adapter_settings=config['adapter_settings']
+    serial_arg = dict(
+        port=adapter_settings['adapter_device'],
+        baudrate=adapter_settings.get('port_baud', 4800),
+        stopbits={
+            1:serial.STOPBITS_ONE,
+            1.5: serial.STOPBITS_ONE_POINT_FIVE,
+            2: serial.STOPBITS_TWO
+        }.get(adapter_settings.get('port_stopbits', 1)),
+        parity={
+            'none': serial.PARITY_NONE,
+            'odd': serial.PARITY_ODD,
+            'even': serial.PARITY_EVEN,
+        }.get(adapter_settings.get('port_parity', 'odd')),
+        rtscts={None: False,
+                False: False,
+                True: True,
+        }.get(adapter_settings.get('expect_cts_state', True)),
+        write_timeout=adapter_settings.get('write_resend_time', 0.5) / 2,
+        timeout=None,
+    )
+
+    print(serial_arg)
+
+    if config["adapter_settings"]["adapter_device"] == ":sim":
+        serial_port = VirtualSerial(**serial_arg, responder=virtual_device)
+    else:
+        serial_port = serial.Serial(**serial_arg)
+
+    serialIf = SerialSource('bsb',
+                            serial_port,
+                            adapter_settings.get('invert_bytes', True))
+
+    bsb_comm = BsbComm(serialIf,
+                       device,
+                       config['bus_address'],
+                       n_addresses=3,
+                       min_wait_s=config.get('min_wait_s', 0.1))
+
     BsbGateway(
-        adapter_settings=config['adapter_settings'],
+        bsb_comm,
         device=device,
-        bus_address=config['bus_address'],
         loggers=loggers,
         atomic_interval=config['atomic_interval'],
         web_interface_port=(config['web_interface_port'] if config['web_interface_enable'] else None),
         web_dashboard=config.get('web_dashboard', []),
         cmd_interface_enable=config['cmd_interface_enable'],
-        min_wait_s=config.get('min_wait_s', 0.1),
     ).run()
